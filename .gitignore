@@ -58,3 +58,10 @@ docsite/
 
 # Jupyter notebook
 .ipynb_checkpoints/
+
+
+siddharta/
+siddhartha/cache
+siddhartha/logs
+siddhartha/output
+siddhartha/.env

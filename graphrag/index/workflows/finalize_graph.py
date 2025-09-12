@@ -4,6 +4,7 @@
 """A module containing run_workflow method definition."""
 
 import logging
+import os
 
 import pandas as pd
 
@@ -13,6 +14,7 @@ from graphrag.index.operations.create_graph import create_graph
 from graphrag.index.operations.finalize_entities import finalize_entities
 from graphrag.index.operations.finalize_relationships import finalize_relationships
 from graphrag.index.operations.snapshot_graphml import snapshot_graphml
+from graphrag.index.operations.snapshot_neo4j import snapshot_neo4j
 from graphrag.index.typing.context import PipelineRunContext
 from graphrag.index.typing.workflow import WorkflowFunctionOutput
 from graphrag.utils.storage import load_table_from_storage, write_table_to_storage
@@ -42,6 +44,30 @@ async def run_workflow(
     await write_table_to_storage(
         final_relationships, "relationships", context.output_storage
     )
+
+    # Optional Neo4j snapshot controlled by environment variables
+    # Set GRAPHRAG_NEO4J_ENABLE=true and provide GRAPHRAG_NEO4J_URI, USERNAME, PASSWORD
+    if os.getenv("GRAPHRAG_NEO4J_ENABLE", "").lower() in ("1", "true", "yes"):  # type: ignore[call-arg]
+        neo4j_uri = os.getenv("GRAPHRAG_NEO4J_URI", "")
+        neo4j_user = os.getenv("GRAPHRAG_NEO4J_USERNAME", "")
+        neo4j_password = os.getenv("GRAPHRAG_NEO4J_PASSWORD", "")
+        neo4j_db = os.getenv("GRAPHRAG_NEO4J_DATABASE")
+        if neo4j_uri and neo4j_user and neo4j_password:
+            try:
+                await snapshot_neo4j(
+                    final_entities,
+                    final_relationships,
+                    uri=neo4j_uri,
+                    username=neo4j_user,
+                    password=neo4j_password,
+                    database=neo4j_db,
+                )
+            except Exception:
+                logger.exception("Error during Neo4j snapshot; continuing without failure")
+        else:
+            logger.warning(
+                "Neo4j snapshot enabled but missing connection envs: GRAPHRAG_NEO4J_URI/USERNAME/PASSWORD"
+            )
 
     if config.snapshots.graphml:
         # todo: extract graphs at each level, and add in meta like descriptions
