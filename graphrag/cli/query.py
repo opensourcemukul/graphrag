@@ -4,9 +4,13 @@
 """CLI implementation of the query subcommand."""
 
 import asyncio
+import logging
+import os
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+import pandas as pd
 
 import graphrag.api as api
 from graphrag.callbacks.noop_query_callbacks import NoopQueryCallbacks
@@ -14,13 +18,13 @@ from graphrag.config.load_config import load_config
 from graphrag.config.models.graph_rag_config import GraphRagConfig
 from graphrag.utils.api import create_storage_from_config
 from graphrag.utils.storage import load_table_from_storage, storage_has_table
-import os
-import pandas as pd
 
 if TYPE_CHECKING:
     import pandas as pd
 
 # ruff: noqa: T201
+
+logger = logging.getLogger(__name__)
 
 
 def run_global_search(
@@ -502,10 +506,11 @@ def _load_entities_relationships_from_neo4j() -> tuple[pd.DataFrame, pd.DataFram
 
     driver = GraphDatabase.driver(uri, auth=(user, pwd))
 
-    node_query = "MATCH (n:__Entity__) RETURN n.title AS title"
+    # Get all properties from nodes and relationships
+    node_query = "MATCH (n:__Entity__) RETURN n"
     rel_query = (
         "MATCH (s:__Entity__)-[r:RELATED]->(t:__Entity__) "
-        "RETURN s.title AS source, t.title AS target, r.weight AS weight"
+        "RETURN s.title AS source, t.title AS target, r"
     )
     print(rel_query)
     try:
@@ -518,16 +523,51 @@ def _load_entities_relationships_from_neo4j() -> tuple[pd.DataFrame, pd.DataFram
         except Exception:
             pass
 
-    entities_df = (
-        pd.DataFrame.from_records(node_rows)
-        if node_rows
-        else pd.DataFrame.from_records([], columns=["title"])  # type: ignore[arg-type]
-    )
-    relationships_df = (
-        pd.DataFrame.from_records(rel_rows)
-        if rel_rows
-        else pd.DataFrame.from_records([], columns=["source", "target", "weight"])  # type: ignore[arg-type]
-    )
+    # Convert Neo4j node objects to flat dictionaries
+    if node_rows:
+        flat_node_rows = []
+        for row in node_rows:
+            node = row["n"]
+            flat_row = {"title": node.get("title")}
+            # Add all other properties
+            for key, value in node.items():
+                if key != "title":
+                    flat_row[key] = value
+            flat_node_rows.append(flat_row)
+        entities_df = pd.DataFrame.from_records(flat_node_rows)
+    else:
+        entities_df = pd.DataFrame.from_records([], columns=["title"])  # type: ignore[arg-type]
+
+    # Convert Neo4j relationship objects to flat dictionaries
+    if rel_rows:
+        flat_rel_rows = []
+        for idx, row in enumerate(rel_rows):
+            rel = row["r"]
+            flat_row = {
+                "source": row["source"],
+                "target": row["target"],
+                "id": f"neo4j_rel_{idx}",  # Generate unique ID
+                "human_readable_id": idx,  # Use index as human readable ID
+                "weight": 1.0,  # Default weight
+                "combined_degree": 1,  # Default combined degree for ranking
+                "description": "",  # Empty description
+                "text_unit_ids": []  # Empty text unit IDs
+            }
+            # Add all relationship properties from Neo4j
+            # Neo4j relationship objects have a 'type' property and properties dict
+            if hasattr(rel, 'type'):
+                flat_row["type"] = rel.type
+            if hasattr(rel, 'properties'):
+                for key, value in rel.properties.items():
+                    flat_row[key] = value
+            elif hasattr(rel, 'items'):
+                # Fallback for dict-like objects
+                for key, value in rel.items():
+                    flat_row[key] = value
+            flat_rel_rows.append(flat_row)
+        relationships_df = pd.DataFrame.from_records(flat_rel_rows)
+    else:
+        relationships_df = pd.DataFrame.from_records([], columns=["source", "target", "id", "human_readable_id", "weight", "combined_degree", "description", "text_unit_ids"])  # type: ignore[arg-type]
     return entities_df, relationships_df
 
 
@@ -539,127 +579,130 @@ def _resolve_output_files(
     """Read indexing output files to a dataframe dict."""
     dataframe_dict = {}
 
-    # Attempt Neo4j override for entities/relationships if enabled
-    neo4j_result = _load_entities_relationships_from_neo4j()
+    # Check if Neo4j backend is enabled
+    neo4j_enabled = os.getenv("GRAPHRAG_QUERY_BACKEND", "").lower() == "neo4j"
+    neo4j_result = None
+    
+    if neo4j_enabled:
+        neo4j_result = _load_entities_relationships_from_neo4j()
+        if neo4j_result is None:
+            logger.warning("Neo4j backend enabled but failed to load data. Falling back to Parquet.")
+            neo4j_enabled = False
 
     # Loading output files for multi-index search
     if config.outputs:
         dataframe_dict["multi-index"] = True
         dataframe_dict["num_indexes"] = len(config.outputs)
         dataframe_dict["index_names"] = config.outputs.keys()
-        for output in config.outputs.values():
-            storage_obj = create_storage_from_config(output)
+        
+        if neo4j_enabled and neo4j_result is not None:
+            # Neo4j mode: use Neo4j data directly for entities/relationships, load other files from Parquet
             for name in output_list:
-                if name not in dataframe_dict:
-                    dataframe_dict[name] = []
-                df_value = asyncio.run(
-                    load_table_from_storage(name=name, storage=storage_obj)
-                )
-                # If Neo4j is enabled, override only after load for entities/relationships
-                if neo4j_result and name in ("entities", "relationships"):
-                    if len(dataframe_dict[name]) == 0:
-                        override_df = neo4j_result[0] if name == "entities" else neo4j_result[1]
-                        if name == "entities":
-                            # Use Parquet entities schema and filter by Neo4j titles to preserve required columns
-                            try:
-                                if not override_df.empty and "title" in df_value.columns:
-                                    titles = set(override_df["title"].dropna().astype(str))
-                                    filtered = df_value[df_value["title"].astype(str).isin(list(titles))]
-                                    # Fallback if filter results empty
-                                    override_df = filtered if not filtered.empty else df_value
-                                else:
-                                    override_df = df_value
-                            except Exception:
-                                override_df = df_value
-                        else:
-                            # relationships: filter Parquet by Neo4j source/target pairs to preserve schema
-                            try:
-                                if not override_df.empty and {"source", "target"}.issubset(df_value.columns):
-                                    # Normalize strings for matching
-                                    neo_src = override_df["source"].dropna().astype(str)
-                                    neo_tgt = override_df["target"].dropna().astype(str)
-                                    neo_pairs = set(zip(neo_src, neo_tgt))
-                                    filtered = df_value[
-                                        df_value[["source", "target"]]
-                                        .astype(str)
-                                        .apply(tuple, axis=1)
-                                        .isin(list(neo_pairs))
-                                    ]
-                                    override_df = filtered if not filtered.empty else df_value
-                                else:
-                                    override_df = df_value
-                            except Exception:
-                                override_df = df_value
-                        dataframe_dict[name].append(override_df)
-                    else:
-                        dataframe_dict[name].append(df_value)
+                if name in ("entities", "relationships"):
+                    # Use Neo4j data directly
+                    neo4j_df = neo4j_result[0] if name == "entities" else neo4j_result[1]
+                    dataframe_dict[name] = [neo4j_df] * len(config.outputs)  # Replicate for each index
                 else:
-                    dataframe_dict[name].append(df_value)
-
-            # for optional output files, do not append if the dataframe does not exist
+                    # Load other files from Parquet for each index
+                    dataframe_dict[name] = []
+                    for output in config.outputs.values():
+                        storage_obj = create_storage_from_config(output)
+                        df_value = asyncio.run(
+                            load_table_from_storage(name=name, storage=storage_obj)
+                        )
+                        dataframe_dict[name].append(df_value)
+            
+            # Load optional files from Parquet
             if optional_list:
                 for optional_file in optional_list:
-                    if optional_file not in dataframe_dict:
-                        dataframe_dict[optional_file] = []
-                    file_exists = asyncio.run(
-                        storage_has_table(optional_file, storage_obj)
-                    )
-                    if file_exists:
-                        df_value = asyncio.run(
-                            load_table_from_storage(
-                                name=optional_file, storage=storage_obj
-                            )
+                    dataframe_dict[optional_file] = []
+                    for output in config.outputs.values():
+                        storage_obj = create_storage_from_config(output)
+                        file_exists = asyncio.run(
+                            storage_has_table(optional_file, storage_obj)
                         )
-                        dataframe_dict[optional_file].append(df_value)
+                        if file_exists:
+                            df_value = asyncio.run(
+                                load_table_from_storage(
+                                    name=optional_file, storage=storage_obj
+                                )
+                            )
+                            dataframe_dict[optional_file].append(df_value)
+                        else:
+                            dataframe_dict[optional_file].append(None)
+        else:
+            # Parquet mode: load all files from Parquet
+            for output in config.outputs.values():
+                storage_obj = create_storage_from_config(output)
+                for name in output_list:
+                    if name not in dataframe_dict:
+                        dataframe_dict[name] = []
+                    df_value = asyncio.run(
+                        load_table_from_storage(name=name, storage=storage_obj)
+                    )
+                    dataframe_dict[name].append(df_value)
+
+                # for optional output files, do not append if the dataframe does not exist
+                if optional_list:
+                    for optional_file in optional_list:
+                        if optional_file not in dataframe_dict:
+                            dataframe_dict[optional_file] = []
+                        file_exists = asyncio.run(
+                            storage_has_table(optional_file, storage_obj)
+                        )
+                        if file_exists:
+                            df_value = asyncio.run(
+                                load_table_from_storage(
+                                    name=optional_file, storage=storage_obj
+                                )
+                            )
+                            dataframe_dict[optional_file].append(df_value)
         return dataframe_dict
     # Loading output files for single-index search
     dataframe_dict["multi-index"] = False
-    storage_obj = create_storage_from_config(config.output)
-    for name in output_list:
-        df_value = asyncio.run(load_table_from_storage(name=name, storage=storage_obj))
-        if neo4j_result and name == "entities":
-            override_df = neo4j_result[0]
-            try:
-                if not override_df.empty and "title" in df_value.columns:
-                    titles = set(override_df["title"].dropna().astype(str))
-                    filtered = df_value[df_value["title"].astype(str).isin(list(titles))]
-                    override_df = filtered if not filtered.empty else df_value
+    
+    if neo4j_enabled and neo4j_result is not None:
+        # Neo4j mode: use Neo4j data directly for entities/relationships, load other files from Parquet
+        for name in output_list:
+            if name in ("entities", "relationships"):
+                # Use Neo4j data directly
+                neo4j_df = neo4j_result[0] if name == "entities" else neo4j_result[1]
+                dataframe_dict[name] = neo4j_df
+            else:
+                # Load other files from Parquet
+                storage_obj = create_storage_from_config(config.output)
+                df_value = asyncio.run(load_table_from_storage(name=name, storage=storage_obj))
+                dataframe_dict[name] = df_value
+        
+        # Load optional files from Parquet
+        if optional_list:
+            storage_obj = create_storage_from_config(config.output)
+            for optional_file in optional_list:
+                file_exists = asyncio.run(storage_has_table(optional_file, storage_obj))
+                if file_exists:
+                    df_value = asyncio.run(
+                        load_table_from_storage(name=optional_file, storage=storage_obj)
+                    )
+                    dataframe_dict[optional_file] = df_value
                 else:
-                    override_df = df_value
-            except Exception:
-                override_df = df_value
-            dataframe_dict[name] = override_df
-        elif neo4j_result and name == "relationships":
-            override_df = neo4j_result[1]
-            try:
-                if not override_df.empty and {"source", "target"}.issubset(df_value.columns):
-                    neo_src = override_df["source"].dropna().astype(str)
-                    neo_tgt = override_df["target"].dropna().astype(str)
-                    neo_pairs = set(zip(neo_src, neo_tgt))
-                    filtered = df_value[
-                        df_value[["source", "target"]]
-                        .astype(str)
-                        .apply(tuple, axis=1)
-                        .isin(list(neo_pairs))
-                    ]
-                    override_df = filtered if not filtered.empty else df_value
-                else:
-                    override_df = df_value
-            except Exception:
-                override_df = df_value
-            dataframe_dict[name] = override_df
-        else:
+                    dataframe_dict[optional_file] = None
+    else:
+        # Parquet mode: load all files from Parquet
+        storage_obj = create_storage_from_config(config.output)
+        for name in output_list:
+            df_value = asyncio.run(load_table_from_storage(name=name, storage=storage_obj))
             dataframe_dict[name] = df_value
 
-    # for optional output files, set the dict entry to None instead of erroring out if it does not exist
-    if optional_list:
-        for optional_file in optional_list:
-            file_exists = asyncio.run(storage_has_table(optional_file, storage_obj))
-            if file_exists:
-                df_value = asyncio.run(
-                    load_table_from_storage(name=optional_file, storage=storage_obj)
-                )
-                dataframe_dict[optional_file] = df_value
-            else:
-                dataframe_dict[optional_file] = None
+        # for optional output files, set the dict entry to None instead of erroring out if it does not exist
+        if optional_list:
+            for optional_file in optional_list:
+                file_exists = asyncio.run(storage_has_table(optional_file, storage_obj))
+                if file_exists:
+                    df_value = asyncio.run(
+                        load_table_from_storage(name=optional_file, storage=storage_obj)
+                    )
+                    dataframe_dict[optional_file] = df_value
+                else:
+                    dataframe_dict[optional_file] = None
+    
     return dataframe_dict

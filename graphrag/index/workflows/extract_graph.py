@@ -4,6 +4,7 @@
 """A module containing run_workflow method definition."""
 
 import logging
+import os
 from typing import Any
 
 import pandas as pd
@@ -59,8 +60,14 @@ async def run_workflow(
         summarization_num_threads=summarization_llm_settings.concurrent_requests,
     )
 
-    await write_table_to_storage(entities, "entities", context.output_storage)
-    await write_table_to_storage(relationships, "relationships", context.output_storage)
+    # Only write to Parquet if Neo4j is not the primary backend
+    neo4j_only_mode = os.getenv("GRAPHRAG_NEO4J_ONLY", "").lower() in ("1", "true", "yes")
+    
+    if not neo4j_only_mode:
+        await write_table_to_storage(entities, "entities", context.output_storage)
+        await write_table_to_storage(relationships, "relationships", context.output_storage)
+    else:
+        logger.info("Neo4j-only mode enabled: skipping Parquet writes for entities and relationships")
 
     if config.snapshots.raw_graph:
         await write_table_to_storage(

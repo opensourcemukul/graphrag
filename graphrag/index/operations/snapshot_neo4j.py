@@ -61,32 +61,48 @@ async def snapshot_neo4j(
 
     driver = GraphDatabase.driver(uri, auth=(username, password))
 
-    node_query = (
-        "MERGE (n:__Entity__ {title: $title}) "
-        "ON CREATE SET n.createdAt = timestamp() "
-        "RETURN n"
-    )
-
-    rel_query = (
-        "MERGE (s:__Entity__ {title: $source}) "
-        "MERGE (t:__Entity__ {title: $target}) "
-        "MERGE (s)-[r:RELATED]->(t) "
-        "SET r.weight = coalesce($weight, r.weight) "
-        "RETURN r"
-    )
-
     def write_nodes(tx, rows: list[dict[str, Any]]):  # type: ignore[no-untyped-def]
         for row in rows:
-            tx.run(node_query, title=row["title"])  # type: ignore[no-untyped-call]
+            # Build dynamic MERGE query with all properties
+            title = row["title"]
+            properties = {k: v for k, v in row.items() if k != "title" and v is not None}
+            
+            # Create SET clause for all properties
+            set_clauses = []
+            for prop, value in properties.items():
+                # Escape property names and handle different data types
+                escaped_prop = f"`{prop}`" if " " in prop or "-" in prop else prop
+                set_clauses.append(f"n.{escaped_prop} = ${prop}")
+            
+            set_clause = ", ".join(set_clauses) if set_clauses else "n.createdAt = timestamp()"
+            
+            query = f"MERGE (n:__Entity__ {{title: $title}}) SET {set_clause} RETURN n"
+            
+            params = {"title": title, **properties}
+            tx.run(query, **params)  # type: ignore[no-untyped-call]
 
     def write_rels(tx, rows: list[dict[str, Any]]):  # type: ignore[no-untyped-def]
         for row in rows:
-            tx.run(  # type: ignore[no-untyped-call]
-                rel_query,
-                source=row["source"],
-                target=row["target"],
-                weight=row.get("weight"),
+            source = row["source"]
+            target = row["target"]
+            properties = {k: v for k, v in row.items() if k not in ["source", "target"] and v is not None}
+            
+            # Create SET clause for all properties
+            set_clauses = []
+            for prop, value in properties.items():
+                escaped_prop = f"`{prop}`" if " " in prop or "-" in prop else prop
+                set_clauses.append(f"r.{escaped_prop} = ${prop}")
+            
+            set_clause = ", ".join(set_clauses) if set_clauses else "r.weight = coalesce($weight, r.weight)"
+            
+            query = (
+                "MERGE (s:__Entity__ {title: $source}) "
+                "MERGE (t:__Entity__ {title: $target}) "
+                f"MERGE (s)-[r:RELATED]->(t) SET {set_clause} RETURN r"
             )
+            
+            params = {"source": source, "target": target, **properties}
+            tx.run(query, **params)  # type: ignore[no-untyped-call]
 
     def _batch_iter(df: pd.DataFrame, cols: list[str], rename: dict[str, str] | None = None):
         r = df[cols].rename(columns=rename or {}).to_dict(orient="records")
@@ -95,20 +111,18 @@ async def snapshot_neo4j(
 
     try:
         with driver.session(database=database) if database else driver.session() as session:
-            # Nodes
-            for batch in _batch_iter(entities, ["title"]):
+            # Nodes - include ALL columns from entities DataFrame
+            entity_cols = list(entities.columns)
+            for batch in _batch_iter(entities, entity_cols):
                 session.execute_write(write_nodes, batch)  # type: ignore[arg-type]
 
-            # Relationships
-            rel_cols = ["source", "target"] + (["weight"] if "weight" in relationships.columns else [])
-            # Coerce to strings for endpoints; weight may be numeric
+            # Relationships - include ALL columns from relationships DataFrame
             rel_df = relationships.copy()
+            # Coerce to strings for endpoints; other columns keep their types
             rel_df["source"] = rel_df["source"].map(_coerce_str)
             rel_df["target"] = rel_df["target"].map(_coerce_str)
-            if "weight" in rel_df.columns:
-                # keep as-is; Neo4j accepts numeric
-                pass
-
+            
+            rel_cols = list(rel_df.columns)
             for batch in _batch_iter(rel_df, rel_cols):
                 session.execute_write(write_rels, batch)  # type: ignore[arg-type]
     finally:

@@ -40,10 +40,16 @@ async def run_workflow(
         layout_enabled=config.umap.enabled,
     )
 
-    await write_table_to_storage(final_entities, "entities", context.output_storage)
-    await write_table_to_storage(
-        final_relationships, "relationships", context.output_storage
-    )
+    # Only write to Parquet if Neo4j is not the primary backend
+    neo4j_only_mode = os.getenv("GRAPHRAG_NEO4J_ONLY", "").lower() in ("1", "true", "yes")
+    
+    if not neo4j_only_mode:
+        await write_table_to_storage(final_entities, "entities", context.output_storage)
+        await write_table_to_storage(
+            final_relationships, "relationships", context.output_storage
+        )
+    else:
+        logger.info("Neo4j-only mode enabled: skipping Parquet writes for entities and relationships")
 
     # Optional Neo4j snapshot controlled by environment variables
     # Set GRAPHRAG_NEO4J_ENABLE=true and provide GRAPHRAG_NEO4J_URI, USERNAME, PASSWORD
