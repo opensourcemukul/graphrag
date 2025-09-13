@@ -11,7 +11,7 @@ this will create a new folder siddharta and a few files like .env and setting.ya
 
 put these in .env file:
 
-GRAPHRAG_API_KEY=sk-proj-***
+GRAPHRAG_API_KEY=your-api-key-here
 export GRAPHRAG_NEO4J_ENABLE=true
 export GRAPHRAG_QUERY_BACKEND=neo4j
 export GRAPHRAG_NEO4J_URI=neo4j://localhost        # or neo4j+s://<host>
